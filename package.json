@@ -9,9 +9,12 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@types/kuromoji": "^0.1.3",
     "eventsource-parser": "^1.1.1",
     "humanloop": "^0.5.36",
+    "kuromoji": "^0.1.2",
     "next": "14.0.4",
+    "openai": "^4.30.0",
     "react": "^18",
     "react-dom": "^18",
     "tiktoken": "^1.0.11"

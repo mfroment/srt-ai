@@ -1,5 +1,7 @@
 import { groupSegmentsByTokenLength, parseStreamedResponse } from "@/lib/srt";
 import { parseSegment } from "@/lib/client";
+import OpenAI from "openai";
+import { splitStringByRatios, tokenizeJapaneseText } from "@/lib/token_tools"
 
 export const dynamic = 'force-dynamic' // defaults to auto
 
@@ -11,44 +13,59 @@ export const dynamic = 'force-dynamic' // defaults to auto
 // We use 4.5 * Input to consider the worst-case scenario where we're translating from
 // English to Indian, which is the longest language in terms of token length.
 const MAX_TOKENS_IN_SEGMENT = 700;
+const MAX_RETRIES = 5;
+
+const openai = new OpenAI({
+  apiKey: process.env['OPENAI_API_KEY'],
+});
+
 
 const retrieveTranslation = async (
   text: string,
   language: string
-) => {
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    method: "POST",
-    body: JSON.stringify({
-      model: "gpt-4-0125-preview",
-      max_tokens: 2048,
-      frequency_penalty: 0,
-      presence_penalty: 0,
-      top_p: 1,
-      temperature: 0,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an experienced semantic translator. Follow the instructions carefully.",
-        },
-        {
-          role: "user",
-          content: `Translate this to ${language}. Interleave the "|" segment separator in the response. ALWAYS return the SAME number of segments. NEVER skip any segment. NEVER combine segments.\n\n${text}`,
-        },
-      ],
-      stream: true,
-    }),
-  });
+): Promise<any> => {
+  let retry_count = 0;
+  while (true) {
+    try {
+      const stream = await openai.chat.completions.create({
+        model: "gpt-4-0125-preview",
+        max_tokens: 2048,
+        // frequency_penalty: 0,
+        // presence_penalty: 0,
+        // top_p: 1,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an experienced semantic translator. Follow the instructions carefully.",
+          },
+          {
+            role: "user",
+            content: `Translate this to ${language}. ONLY translate, NEVER provide explanations or insight on the translation itself, just strictly translate the text as clearly as you can, assuming the reader will have the context. The text to translate starts on the next line.\n\n${text}`,
+          },
+        ],
+        stream: true,
+      });
 
-  if (response.status !== 200) {
-    throw new Error("OpenAI API returned an error");
+      return stream;
+    } catch (error) {
+      if (error instanceof OpenAI.APIError) {
+        console.error(error);
+        retry_count++;
+        if (retry_count >= MAX_RETRIES) {
+          console.error("... Max retries reached, aborting.");
+          break;
+        } else {
+          console.error("... Retrying");
+        }
+      } else {
+        console.error(error);
+        console.error("... Not an API error, no retry.")
+        break;
+      }
+    }
   }
-
-  return response;
 };
 
 export async function POST(request: Request) {
@@ -64,20 +81,44 @@ export async function POST(request: Request) {
     const stream = new ReadableStream({
       async start(controller) {
         for (const group of groups) {
-          const text = group.map((segment) => segment.text).join("|");
+          const text = group.map((segment) => segment.text).join(" ");
           const response = await retrieveTranslation(text, language);
           const srtStream = parseStreamedResponse(response);
           const reader = srtStream.getReader();
 
+          const g_lengths = group.map((segment) => segment.text.length);
+
+          let decoded = "";
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
               break;
             }
+            decoded += decoder.decode(value);
+          }
 
-            const timestamp = segments[index].timestamp;
-            const decoded = decoder.decode(value);
-            const srt = [++index, timestamp, decoded].join("\n")
+          const parts = [];
+          if (/^\[\[ERROR:.*\]\]$/.test(decoded))
+          {
+            parts.push(...Array(group.length).fill(decoded));
+          } else {
+            const tokens: string[]= [];
+            if (language === 'Japanese')
+            {
+              const jtokens = await tokenizeJapaneseText(decoded);
+              tokens.push(...jtokens.map(jtoken => jtoken.surface_form));
+            }
+            else
+            {
+              const wtokens = decoded.match(/(\S+|\s+)/g) || [];
+              tokens.push(...wtokens);
+            }
+            parts.push(...splitStringByRatios(tokens, g_lengths));
+          }
+          let partIndex = 0;
+
+          for (const g of group) {
+            const srt = [ g.id, g.timestamp, g.text + '\n' + parts[partIndex++] + '\n\n' ].join('\n');
             controller.enqueue(encoder.encode(srt));
           }
         }
